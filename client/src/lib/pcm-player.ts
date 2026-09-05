@@ -6,8 +6,17 @@ export class PCMStreamPlayer {
   private receivedFrames = 0;
   public expectedFrames = 0;
   private streamEndTimeout: ReturnType<typeof setTimeout> | null = null;
+  private analyserNode: AnalyserNode | null = null;
 
   public onEnded: (() => void) | null = null;
+
+  public getAnalyserNode(): AnalyserNode | null {
+    return this.analyserNode;
+  }
+
+  public getAudioContext(): AudioContext | null {
+    return this.audioCtx;
+  }
 
   constructor(sampleRate = 24000) {
     this.sampleRate = sampleRate;
@@ -17,6 +26,10 @@ export class PCMStreamPlayer {
     if (!this.audioCtx) {
       const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
       this.audioCtx = new AudioCtxClass({ sampleRate: this.sampleRate });
+      this.analyserNode = this.audioCtx.createAnalyser();
+      this.analyserNode.fftSize = 256;
+      this.analyserNode.smoothingTimeConstant = 0.7;
+      this.analyserNode.connect(this.audioCtx.destination);
     }
     if (this.audioCtx.state === 'suspended') {
       this.audioCtx.resume();
@@ -54,7 +67,7 @@ export class PCMStreamPlayer {
 
     const source = this.audioCtx.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.audioCtx.destination);
+    source.connect(this.analyserNode!);
 
     // Schedule playback seamlessly
     const currentTime = this.audioCtx.currentTime;

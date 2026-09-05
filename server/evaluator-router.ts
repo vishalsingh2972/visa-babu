@@ -153,7 +153,7 @@ Return output strictly in JSON format:
     const startTime = Date.now();
 
     const greetingText =
-      "Good morning. I am the consular officer handling your visa interview. Please state your name and visa category, and briefly describe your primary technical work or field of study.";
+      "Good morning Vishal, I see you're applying for H1B visa. Tell me about your primary technical work.";
 
     const response = await axios.post(
       'https://api.cartesia.ai/tts/bytes',

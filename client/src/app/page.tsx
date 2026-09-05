@@ -7,6 +7,7 @@ import { PCMStreamPlayer } from "@/lib/pcm-player";
 import { AnalyticsModal } from "@/components/AnalyticsModal";
 import { ConversationTimeline, TimelineEntry } from "@/components/ConversationTimeline";
 import { ScoreGauge } from "@/components/ScoreGauge";
+import { ConsularFace2D } from "@/components/ConsularFace2D";
 import {
   Phone,
   PhoneOff,
@@ -68,6 +69,15 @@ export default function VoiceDashboard() {
     verdict: string;
     score: number;
   } | null>(null);
+  const [showAvatar, setShowAvatar] = useState(false);
+  const [fillerCount, setFillerCount] = useState(0);
+  const [currentWPM, setCurrentWPM] = useState(0);
+  const [speechStartTime, setSpeechStartTime] = useState<number | null>(null);
+  const [sessionMetrics, setSessionMetrics] = useState({
+    totalFillers: 0,
+    avgWPM: 0,
+    answers: [] as { text: string; fillers: number; wpm: number; words: number }[],
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const pcmPlayerRef = useRef<PCMStreamPlayer | null>(null);
@@ -88,6 +98,46 @@ export default function VoiceDashboard() {
     isCallActiveRef.current = isCallActive;
   }, [isCallActive]);
 
+  // Filler word detection + WPM analysis
+  const FILLER_WORDS = ["um", "uh", "like", "actually", "basically", "you know", "i mean", "sort of", "kind of", "right", "so", "well", "just", "really", "very", "literally"];
+
+  useEffect(() => {
+    if (!transcript) return;
+    const words = transcript.toLowerCase().split(/\s+/).filter(w => w.length > 0);
+    let count = 0;
+    words.forEach(word => {
+      FILLER_WORDS.forEach(filler => {
+        if (word === filler || word.includes(filler)) count++;
+      });
+    });
+    setFillerCount(count);
+  }, [transcript]);
+
+  // Track speech start time for WPM + real-time WPM calculation
+  useEffect(() => {
+    if (orbState === "listening" && !speechStartTime) {
+      setSpeechStartTime(Date.now());
+    } else if (orbState !== "listening" && speechStartTime) {
+      setSpeechStartTime(null);
+    }
+  }, [orbState, speechStartTime]);
+
+  // Calculate real-time WPM while speaking
+  useEffect(() => {
+    if (!isCallActive || orbState !== "listening" || !speechStartTime) {
+      setCurrentWPM(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      const elapsed = (Date.now() - speechStartTime) / 1000 / 60; // minutes
+      const wordCount = transcript.split(/\s+/).filter(w => w.length > 0).length;
+      if (elapsed > 0 && wordCount > 0) {
+        setCurrentWPM(Math.round(wordCount / elapsed));
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [isCallActive, orbState, speechStartTime, transcript]);
+
   // Function to transmit candidate speech over WebSocket
   const sendTranscriptToServer = useCallback(() => {
     const textToSend = transcriptRef.current.trim();
@@ -101,6 +151,15 @@ export default function VoiceDashboard() {
         // Safe catch if already stopped
       }
     }
+
+    // Track answer metrics
+    const wordCount = textToSend.split(/\s+/).filter(w => w.length > 0).length;
+    const answerFillers = fillerCount;
+    setSessionMetrics((prev) => ({
+      ...prev,
+      totalFillers: prev.totalFillers + answerFillers,
+      answers: [...prev.answers, { text: textToSend, fillers: answerFillers, wpm: currentWPM, words: wordCount }],
+    }));
 
     // Add candidate entry to timeline
     timelineIdRef.current++;
@@ -198,15 +257,15 @@ export default function VoiceDashboard() {
           engineUsed: msg.engineUsed,
         }));
         setOrbState("speaking");
-        setTimelineEntries((prev) => [
-          ...prev,
-          {
-            id: ++timelineIdRef.current,
-            role: "officer",
-            content: "Good morning. I am the consular officer handling your visa interview. Please state your name and visa category, and briefly describe your primary technical work or field of study.",
-            timestamp: Date.now(),
-          },
-        ]);
+            setTimelineEntries((prev) => [
+              ...prev,
+              {
+                id: ++timelineIdRef.current,
+                role: "officer",
+                content: "Good morning Vishal, I see you're applying for H1B visa. Tell me about your primary technical work.",
+                timestamp: Date.now(),
+              },
+            ]);
         console.log("Greeting stream ready. Playing officer initial greeting...");
       }
 
@@ -418,7 +477,28 @@ export default function VoiceDashboard() {
             <span className="bg-gradient-to-r from-amber-300 via-amber-400 to-yellow-500 bg-clip-text text-transparent">
               VISA-BABU
             </span>
-            <span className="text-slate-300 ml-2 text-base font-medium">// Realtime Voice Session</span>
+            <motion.span
+              className="text-slate-300 ml-2 text-base font-medium inline-flex items-center gap-2"
+              animate={{ rotate: [0, 5, -5, 0] }}
+              transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+            >
+              <span className="inline-block animate-pulse">🇮🇳</span>
+              <motion.span
+                className="inline-block text-2xl"
+                animate={{ scale: [1, 1.2, 1], rotate: [0, 10, -10, 0] }}
+                transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+                title="Govinda Raja Babu"
+              >
+                🕺
+              </motion.span>
+              <motion.span
+                className="inline-block text-xl"
+                animate={{ y: [0, -5, 0] }}
+                transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
+              >
+                🎬
+              </motion.span>
+            </motion.span>
           </h1>
         </div>
 
@@ -487,11 +567,44 @@ export default function VoiceDashboard() {
             <span>H-1B Technical Visa Interview Simulation</span>
           </div>
 
-          <VoiceOrb
-            state={orbState}
-            audioLevel={orbState === "speaking" || orbState === "listening" ? 0.7 : 0.2}
-            onClick={toggleCallSession}
-          />
+          {/* Toggle between Orb and 2D Avatar */}
+          <div className="flex items-center space-x-2 mb-3">
+            <button
+              onClick={() => setShowAvatar(false)}
+              className={`px-3 py-1 rounded-full text-[10px] font-mono transition ${
+                !showAvatar
+                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                  : "bg-slate-800/50 text-slate-500 border border-slate-700"
+              }`}
+            >
+              ◉ Orb
+            </button>
+            <button
+              onClick={() => setShowAvatar(true)}
+              className={`px-3 py-1 rounded-full text-[10px] font-mono transition ${
+                showAvatar
+                  ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                  : "bg-slate-800/50 text-slate-500 border border-slate-700"
+              }`}
+            >
+              👤 Officer
+            </button>
+          </div>
+
+          {showAvatar ? (
+            <ConsularFace2D
+              analyserNode={pcmPlayerRef.current?.getAnalyserNode() || null}
+              isSpeaking={orbState === "speaking"}
+              isListening={orbState === "listening"}
+              isProcessing={orbState === "processing"}
+            />
+          ) : (
+            <VoiceOrb
+              state={orbState}
+              audioLevel={orbState === "speaking" || orbState === "listening" ? 0.7 : 0.2}
+              onClick={toggleCallSession}
+            />
+          )}
 
           <div className="mt-4 flex flex-col items-center space-y-3">
             <button
@@ -540,13 +653,47 @@ export default function VoiceDashboard() {
             )}
           </AnimatePresence>
 
+          {/* Live Feedback Panel */}
+          <AnimatePresence>
+            {isCallActive && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+                className="w-full max-w-md mt-5 p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md"
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Live Feedback</span>
+                  <span className="text-[10px] font-mono text-slate-500">Round {maxRounds || 1}/5</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex items-center space-x-2">
+                    <div className={`w-2 h-2 rounded-full ${fillerCount > 5 ? "bg-rose-400" : fillerCount > 2 ? "bg-amber-400" : "bg-emerald-400"}`} />
+                    <span className="text-xs font-mono text-slate-300">
+                      Fillers: <strong className={fillerCount > 5 ? "text-rose-400" : "text-emerald-400"}>{fillerCount}</strong>
+                    </span>
+                  </div>
+                  <div className="flex items-center space-x-2">
+                    <div className={`w-2 h-2 rounded-full ${currentWPM > 180 || currentWPM < 100 && currentWPM > 0 ? "bg-rose-400" : currentWPM > 0 ? "bg-emerald-400" : "bg-slate-500"}`} />
+                    <span className="text-xs font-mono text-slate-300">
+                      WPM: <strong className="text-cyan-400">{currentWPM || "--"}</strong>
+                    </span>
+                  </div>
+                </div>
+                {fillerCount > 5 && (
+                  <p className="text-[10px] font-mono text-rose-400 mt-2">⚠ Too many filler words! Try to reduce "um", "like", "actually".</p>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <AnimatePresence>
             {isCallActive && transcript && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0 }}
-                className="w-full max-w-md mt-6 p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md flex items-center space-x-3"
+                className="w-full max-w-md mt-3 p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md flex items-center space-x-3"
               >
                 <Mic className="w-4 h-4 text-amber-400 animate-pulse flex-shrink-0" />
                 <p className="text-sm font-mono text-slate-300 italic truncate">
@@ -691,6 +838,120 @@ export default function VoiceDashboard() {
                     <span className="text-xs font-mono text-rose-400">
                       ✗ The officer was not convinced by the evidence presented.
                     </span>
+                  )}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Round-by-Round Score Breakdown */}
+          <AnimatePresence>
+            {finalVerdict && sessionMetrics.answers.length > 0 && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 20 }}
+                transition={{ duration: 0.5, delay: 0.2 }}
+                className="bg-slate-900/50 border border-slate-800/80 backdrop-blur-md rounded-2xl p-5"
+              >
+                <div className="flex items-center space-x-2 mb-4">
+                  <BarChart3 className="w-4 h-4 text-indigo-400" />
+                  <span className="text-sm font-semibold tracking-wide text-slate-300 uppercase">Round-by-Round Scores</span>
+                </div>
+                <div className="space-y-2">
+                  {sessionMetrics.answers.map((answer, idx) => (
+                    <div key={idx} className="flex items-center justify-between">
+                      <div className="flex items-center space-x-2">
+                        <span className="text-[10px] font-mono text-slate-500 w-14">Round {idx + 1}</span>
+                        <div className="w-24 h-2 rounded-full bg-slate-800 overflow-hidden">
+                          <div
+                            className={`h-full rounded-full ${
+                              answer.fillers > 10 ? "bg-rose-400" : answer.fillers > 5 ? "bg-amber-400" : "bg-emerald-400"
+                            }`}
+                            style={{ width: `${Math.min(100, Math.max(10, 100 - answer.fillers * 5))}%` }}
+                          />
+                        </div>
+                      </div>
+                      <div className="flex items-center space-x-3">
+                        <span className="text-[10px] font-mono text-slate-500">{answer.fillers} fillers</span>
+                        <span className={`text-xs font-bold font-mono ${
+                          answer.fillers > 10 ? "text-rose-400" : answer.fillers > 5 ? "text-amber-400" : "text-emerald-400"
+                        }`}>
+                          {answer.fillers > 10 ? "WEAK" : answer.fillers > 5 ? "OK" : "STRONG"}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Post-Interview Report Card */}
+          <AnimatePresence>
+            {finalVerdict && (
+              <motion.div
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 20 }}
+                transition={{ duration: 0.5, delay: 0.3 }}
+                className="bg-slate-900/50 border border-slate-800/80 backdrop-blur-md rounded-2xl p-5"
+              >
+                <div className="flex items-center space-x-2 mb-4">
+                  <AlertTriangle className="w-4 h-4 text-amber-400" />
+                  <span className="text-sm font-semibold tracking-wide text-slate-300 uppercase">Performance Report</span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 mb-4">
+                  <div className="p-3 rounded-lg bg-slate-950/50 border border-slate-800">
+                    <div className="text-[10px] font-mono text-slate-500 mb-1">Total Filler Words</div>
+                    <div className={`text-lg font-bold font-mono ${fillerCount > 20 ? "text-rose-400" : fillerCount > 10 ? "text-amber-400" : "text-emerald-400"}`}>
+                      {fillerCount}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-lg bg-slate-950/50 border border-slate-800">
+                    <div className="text-[10px] font-mono text-slate-500 mb-1">Speech Pace</div>
+                    <div className={`text-lg font-bold font-mono ${currentWPM > 180 || (currentWPM < 100 && currentWPM > 0) ? "text-rose-400" : "text-emerald-400"}`}>
+                      {currentWPM} <span className="text-xs text-slate-500">WPM</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider">Tips</span>
+                  {fillerCount > 20 && (
+                    <p className="text-xs font-mono text-rose-400 flex items-start space-x-2">
+                      <span>⚠</span>
+                      <span>You used {fillerCount} filler words. Practice pausing silently instead of "um" or "like".</span>
+                    </p>
+                  )}
+                  {fillerCount <= 20 && fillerCount > 10 && (
+                    <p className="text-xs font-mono text-amber-400 flex items-start space-x-2">
+                      <span>△</span>
+                      <span>Good! But try to reduce fillers further. Aim for less than 10.</span>
+                    </p>
+                  )}
+                  {fillerCount <= 10 && fillerCount > 0 && (
+                    <p className="text-xs font-mono text-emerald-400 flex items-start space-x-2">
+                      <span>✓</span>
+                      <span>Excellent! Minimal filler words. You sound confident.</span>
+                    </p>
+                  )}
+                  {currentWPM > 180 && (
+                    <p className="text-xs font-mono text-rose-400 flex items-start space-x-2">
+                      <span>⚠</span>
+                      <span>Speaking too fast ({currentWPM} WPM). Slow down to 130-160 WPM.</span>
+                    </p>
+                  )}
+                  {currentWPM < 100 && currentWPM > 0 && (
+                    <p className="text-xs font-mono text-amber-400 flex items-start space-x-2">
+                      <span>△</span>
+                      <span>Speaking slowly ({currentWPM} WPM). This can sound hesitant.</span>
+                    </p>
+                  )}
+                  {currentWPM >= 100 && currentWPM <= 180 && currentWPM > 0 && (
+                    <p className="text-xs font-mono text-emerald-400 flex items-start space-x-2">
+                      <span>✓</span>
+                      <span>Great pace! {currentWPM} WPM is in the ideal range.</span>
+                    </p>
                   )}
                 </div>
               </motion.div>
