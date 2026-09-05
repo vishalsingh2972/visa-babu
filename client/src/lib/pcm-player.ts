@@ -2,6 +2,12 @@ export class PCMStreamPlayer {
   private audioCtx: AudioContext | null = null;
   private nextStartTime: number = 0;
   private sampleRate: number;
+  private queuedSources: AudioBufferSourceNode[] = [];
+  private receivedFrames = 0;
+  public expectedFrames = 0;
+  private streamEndTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  public onEnded: (() => void) | null = null;
 
   constructor(sampleRate = 24000) {
     this.sampleRate = sampleRate;
@@ -23,6 +29,8 @@ export class PCMStreamPlayer {
   public playChunk(base64Data: string) {
     this.initContext();
     if (!this.audioCtx) return;
+
+    this.receivedFrames++;
 
     // Decode Base64 to Int16 Array
     const binaryString = atob(base64Data);
@@ -54,15 +62,106 @@ export class PCMStreamPlayer {
       this.nextStartTime = currentTime;
     }
 
+    // Track the scheduled end time for this source
+    const scheduledEndTime = this.nextStartTime + buffer.duration;
+    source.onended = () => {
+      const sourceIndex = this.queuedSources.indexOf(source);
+      if (sourceIndex !== -1) {
+        this.queuedSources.splice(sourceIndex, 1);
+      }
+
+      // Only fire onEnded if we've received and played all expected frames
+      if (
+        this.expectedFrames > 0 &&
+        this.queuedSources.length === 0 &&
+        this.onEnded
+      ) {
+        if (this.receivedFrames >= this.expectedFrames) {
+          this.fireOnEnded();
+        } else {
+          // Some frames may have been dropped by network throttling.
+          // Start fallback timer to fire onEnded after 4s grace period.
+          if (this.streamEndTimeout) clearTimeout(this.streamEndTimeout);
+          this.streamEndTimeout = setTimeout(() => {
+            if (this.queuedSources.length === 0 && this.onEnded) {
+              this.fireOnEnded();
+            }
+          }, 4000);
+        }
+      }
+    };
+
     source.start(this.nextStartTime);
-    this.nextStartTime += buffer.duration;
+    this.nextStartTime = scheduledEndTime;
+    this.queuedSources.push(source);
+  }
+
+  private fireOnEnded() {
+    if (!this.onEnded) return;
+    const cb = this.onEnded;
+    // Reset counters for the next stream
+    this.receivedFrames = 0;
+    this.expectedFrames = 0;
+    if (this.streamEndTimeout) {
+      clearTimeout(this.streamEndTimeout);
+      this.streamEndTimeout = null;
+    }
+    cb();
+  }
+
+  /**
+   * Signal that the current stream is complete.
+   * The onEnded callback will fire once all expected frames have finished playing.
+   */
+  public markStreamEnd(expectedTotalFrames?: number) {
+    if (expectedTotalFrames !== undefined) {
+      this.expectedFrames = expectedTotalFrames;
+    }
+
+    // If no chunks are queued and we have the expected frame count, fire onEnded immediately
+    if (
+      this.queuedSources.length === 0 &&
+      this.expectedFrames > 0 &&
+      this.receivedFrames >= this.expectedFrames &&
+      this.onEnded
+    ) {
+      this.fireOnEnded();
+      return;
+    }
+
+    // Fallback: in case network throttling drops some frames and receivedFrames never reaches
+    // expectedFrames, fire onEnded after a 4-second grace period if all audio has finished playing.
+    if (this.queuedSources.length === 0 && this.expectedFrames > 0 && this.onEnded) {
+      if (this.streamEndTimeout) clearTimeout(this.streamEndTimeout);
+      this.streamEndTimeout = setTimeout(() => {
+        if (this.queuedSources.length === 0 && this.onEnded) {
+          this.fireOnEnded();
+        }
+      }, 4000);
+    }
   }
 
   public stop() {
     if (this.audioCtx) {
+      // Stop all active sources to immediately halt playback
+      for (const source of this.queuedSources) {
+        try {
+          source.stop();
+        } catch (e) {
+          // Already stopped
+        }
+      }
       this.audioCtx.close();
       this.audioCtx = null;
     }
+    if (this.streamEndTimeout) {
+      clearTimeout(this.streamEndTimeout);
+      this.streamEndTimeout = null;
+    }
+    this.queuedSources = [];
     this.nextStartTime = 0;
+    this.receivedFrames = 0;
+    this.expectedFrames = 0;
+    // Don't null onEnded - it should persist for new sessions
   }
 }

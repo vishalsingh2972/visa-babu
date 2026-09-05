@@ -72,7 +72,48 @@ Return output strictly in JSON format:
   }
 
   /**
-   * Step 2: Route Feedback Text to the Appropriate TTS Engine
+   * Step 2: Synthesize the Visa Officer's initial cold-start greeting
+   */
+  public async synthesizeGreeting(): Promise<TTSPayload> {
+    const startTime = Date.now();
+
+    const greetingText =
+      "Good morning. I am the consular officer handling your visa interview. Please state your name and visa category, and briefly describe your primary technical work or field of study.";
+
+    const response = await axios.post(
+      'https://api.cartesia.ai/tts/bytes',
+      {
+        model_id: 'sonic-3.6',
+        transcript: greetingText,
+        voice: {
+          mode: 'id',
+          id: '7cf0e2b1-8daf-4fe4-89ad-f6039398f359' // "Benedict" British Officer
+        },
+        output_format: {
+          container: 'raw',
+          encoding: 'pcm_s16le',
+          sample_rate: 24000
+        }
+      },
+      {
+        headers: {
+          'Cartesia-Version': '2024-06-10',
+          'X-API-Key': this.cartesiaKey,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+
+    return {
+      audioBuffer: Buffer.from(response.data),
+      engineUsed: 'Cartesia-Sonic-3.6',
+      ttfbMs: Date.now() - startTime
+    };
+  }
+
+  /**
+   * Step 3: Route Feedback Text to the Appropriate TTS Engine
    */
   public async synthesizeRoutedSpeech(evalResult: EvaluationResult): Promise<TTSPayload> {
     const startTime = Date.now();

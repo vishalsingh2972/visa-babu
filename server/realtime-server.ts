@@ -60,6 +60,41 @@ fastify.register(async function (app: FastifyInstance) {
       try {
         const message = JSON.parse(rawMessage.toString());
 
+        if (message.type === 'start_session') {
+          console.log(`\n🤝 [Server] Session started. Triggering Visa Officer initial greeting...`);
+
+          const greetingStart = Date.now();
+          const greetingPayload = await evaluatorRouter.synthesizeGreeting();
+          const greetingLatencyMs = Date.now() - greetingStart;
+
+          ws.send(
+            JSON.stringify({
+              type: 'greeting_ready',
+              engineUsed: greetingPayload.engineUsed,
+              latencyMs: greetingLatencyMs,
+              byteLength: greetingPayload.audioBuffer.byteLength
+            })
+          );
+
+          // Stream greeting audio chunks through the throttler (960 bytes = 20ms @ 24kHz PCM)
+          const CHUNK_SIZE = 960;
+          const buffer = greetingPayload.audioBuffer;
+
+          for (let offset = 0; offset < buffer.length; offset += CHUNK_SIZE) {
+            const chunk = buffer.subarray(offset, offset + CHUNK_SIZE);
+            throttler.pushAudioChunk(chunk);
+          }
+
+          // Signal end of greeting audio stream
+          ws.send(
+            JSON.stringify({
+              type: 'stream_complete',
+              streamKind: 'greeting',
+              totalFrames: Math.ceil(buffer.length / CHUNK_SIZE)
+            })
+          );
+        }
+
         if (message.type === 'submit_transcript') {
           const startTime = Date.now();
           console.log(`\n📥 [Server] Received candidate response: "${message.transcript}"`);
@@ -99,6 +134,15 @@ fastify.register(async function (app: FastifyInstance) {
             const chunk = buffer.subarray(offset, offset + CHUNK_SIZE);
             throttler.pushAudioChunk(chunk);
           }
+
+          // Signal end of this evaluation audio stream
+          ws.send(
+            JSON.stringify({
+              type: 'stream_complete',
+              streamKind: 'evaluation',
+              totalFrames: Math.ceil(buffer.length / CHUNK_SIZE)
+            })
+          );
         }
       } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);

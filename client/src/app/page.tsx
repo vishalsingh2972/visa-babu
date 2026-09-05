@@ -54,11 +54,17 @@ export default function VoiceDashboard() {
   const startTimeRef = useRef<number>(0);
   const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const transcriptRef = useRef<string>("");
+  const isCallActiveRef = useRef(false);
 
   // Keep transcriptRef synchronized with state for callback access
   useEffect(() => {
     transcriptRef.current = transcript;
   }, [transcript]);
+
+  // Keep isCallActive synchronized with ref for stable callbacks
+  useEffect(() => {
+    isCallActiveRef.current = isCallActive;
+  }, [isCallActive]);
 
   // Function to transmit candidate speech over WebSocket
   const sendTranscriptToServer = useCallback(() => {
@@ -99,52 +105,68 @@ export default function VoiceDashboard() {
     transcriptRef.current = "";
   }, []);
 
-  // Handle continuous audio chunk stream and trigger listening auto-resume
-  const handleIncomingAudioChunk = useCallback((base64Payload: string, metricsData: any) => {
-    if (pcmPlayerRef.current) {
-      pcmPlayerRef.current.playChunk(base64Payload);
+  // Open mic for next candidate response (auto-resume after officer speech)
+  const openMicrophone = useCallback(() => {
+    if (isCallActiveRef.current && recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setOrbState("listening");
+      } catch (err) {
+        console.error("Failed auto-resuming mic:", err);
+      }
+    } else {
+      setOrbState("idle");
     }
+  }, []);
 
-    setMetrics((prev) => {
-      const isFirstFrame = prev.framesReceived === 0;
-      const calculatedTTFB = isFirstFrame ? Date.now() - startTimeRef.current : prev.ttfb;
+  // Handle continuous audio chunk stream
+  const handleIncomingAudioChunk = useCallback(
+    (base64Payload: string, metricsData: any) => {
+      if (pcmPlayerRef.current) {
+        pcmPlayerRef.current.playChunk(base64Payload);
+      }
 
-      return {
-        ...prev,
-        framesReceived: prev.framesReceived + 1,
-        ttfb: calculatedTTFB,
-        effectiveBandwidth: metricsData?.effectiveBandwidthKbps || 0,
-      };
-    });
+      setMetrics((prev) => {
+        const isFirstFrame = prev.framesReceived === 0;
+        const calculatedTTFB = isFirstFrame ? Date.now() - startTimeRef.current : prev.ttfb;
 
-    // Automatically transition to listening state once PCM audio finishes playing
-    if (pcmPlayerRef.current) {
-      pcmPlayerRef.current.onEnded = () => {
-        if (isCallActive && recognitionRef.current) {
-          try {
-            recognitionRef.current.start();
-            setOrbState("listening");
-          } catch (err) {
-            console.error("Failed auto-resuming mic:", err);
-          }
-        } else {
-          setOrbState("idle");
-        }
-      };
-    }
-  }, [isCallActive]);
+        return {
+          ...prev,
+          framesReceived: prev.framesReceived + 1,
+          ttfb: calculatedTTFB,
+          effectiveBandwidth: metricsData?.effectiveBandwidthKbps || 0,
+        };
+      });
+    },
+    []
+  );
 
   useEffect(() => {
     pcmPlayerRef.current = new PCMStreamPlayer(24000);
+
+    // Define auto-resume listener: when officer audio finishes, open mic
+    pcmPlayerRef.current.onEnded = openMicrophone;
+
     const ws = new WebSocket("ws://localhost:8080/ws/eval");
 
     ws.onopen = () => {
       setIsConnected(true);
-      console.log("Connected to Realtime Voice Server");
+      console.log("WebSocket Gateway Connected.");
     };
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
+
+      if (msg.type === "greeting_ready") {
+        // Officer greeting is ready to stream
+        setMetrics((prev) => ({
+          ...prev,
+          ttsLatency: msg.latencyMs,
+          engineUsed: msg.engineUsed,
+        }));
+        setOrbState("speaking");
+        console.log("Greeting stream ready. Playing officer initial greeting...");
+      }
 
       if (msg.type === "eval_verdict") {
         setVerdict(msg.evalResult);
@@ -159,6 +181,15 @@ export default function VoiceDashboard() {
           engineUsed: msg.engineUsed,
         }));
         setOrbState("speaking");
+      }
+
+      if (msg.type === "stream_complete") {
+        // All audio chunks for this stream have been sent.
+        // Signal the player to fire onEnded once all expected frames finish playing.
+        console.log(`Stream complete (${msg.streamKind}). Total frames: ${msg.totalFrames}`);
+        if (pcmPlayerRef.current) {
+          pcmPlayerRef.current.markStreamEnd(msg.totalFrames);
+        }
       }
 
       if (msg.type === "audio_chunk") {
@@ -206,7 +237,19 @@ export default function VoiceDashboard() {
         }, 1500);
       };
 
-      recognition.onerror = (err: any) => console.error("Mic error:", err);
+      recognition.onerror = (err: any) => {
+        console.error("Mic error:", err);
+        // If recognition errors during active call, try to restart after a short delay
+        if (isCallActiveRef.current && err.error !== "aborted") {
+          setTimeout(() => {
+            try {
+              recognitionRef.current?.start();
+            } catch (e) {
+              // Already starting
+            }
+          }, 500);
+        }
+      };
       recognitionRef.current = recognition;
     }
 
@@ -215,7 +258,7 @@ export default function VoiceDashboard() {
       pcmPlayerRef.current?.stop();
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
-  }, [handleIncomingAudioChunk, sendTranscriptToServer]);
+  }, [handleIncomingAudioChunk, sendTranscriptToServer, openMicrophone]);
 
   // Telemetry metric logging
   useEffect(() => {
@@ -250,24 +293,45 @@ export default function VoiceDashboard() {
       return;
     }
 
-    if (isCallActive) {
+    if (isCallActiveRef.current) {
       // Hang up session
       try {
         recognitionRef.current.stop();
       } catch (e) {}
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       setIsCallActive(false);
+      isCallActiveRef.current = false;
       setOrbState("idle");
       setTranscript("");
+      if (pcmPlayerRef.current) pcmPlayerRef.current.stop();
     } else {
-      // Start continuous call session
+      // Start session: trigger officer cold-start greeting, NOT immediate mic open
       setTranscript("");
-      try {
-        recognitionRef.current.start();
-        setIsCallActive(true);
-        setOrbState("listening");
-      } catch (err) {
-        console.error("Error starting speech recognition:", err);
+      setVerdict(null);
+      setMetrics({
+        evalLatency: 0,
+        ttsLatency: 0,
+        ttfb: 0,
+        framesReceived: 0,
+        engineUsed: "-",
+        effectiveBandwidth: 0,
+        packetLosses: 0,
+      });
+
+      setIsCallActive(true);
+      isCallActiveRef.current = true;
+      setOrbState("processing"); // Show processing while greeting is being synthesized
+
+      // Request officer greeting from server
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        startTimeRef.current = Date.now();
+        wsRef.current.send(JSON.stringify({ type: "start_session" }));
+        console.log("Session initialized. Triggering Visa Officer initial greeting...");
+      } else {
+        console.error("WebSocket not connected. Cannot start session.");
+        setIsCallActive(false);
+        isCallActiveRef.current = false;
+        setOrbState("idle");
       }
     }
   };
@@ -330,14 +394,18 @@ export default function VoiceDashboard() {
             ) : (
               <>
                 <Phone className="w-5 h-5" />
-                <span>Start Hands-Free Call</span>
+                <span>Start Visa Interview Session</span>
               </>
             )}
           </button>
           <span className="text-xs font-mono text-slate-500">
             {isCallActive
-              ? "Speech detection active. Stop speaking for 1.5s to trigger evaluator."
-              : "Click once to start seamless continuous conversation."}
+              ? orbState === "speaking"
+                ? "Officer speaking... mic muted."
+                : orbState === "processing"
+                ? "Initializing session..."
+                : "Listening... Stop speaking for 1.5s to submit."
+              : "Click once to begin a seamless visa interview with the AI officer."}
           </span>
         </div>
 
