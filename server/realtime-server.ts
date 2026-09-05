@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import dotenv from 'dotenv';
 import { EvaluatorRouter } from './evaluator-router.js';
+import type { ConversationMessage } from './evaluator-router.js';
 import { NetworkThrottler } from './network-throttler.js';
 
 dotenv.config();
@@ -25,6 +26,10 @@ fastify.register(async function (app: FastifyInstance) {
     // Standardize access across @fastify/websocket version variations
     const ws = connection.socket || connection;
     console.log('⚡ [Server] Client connected to /ws/eval');
+
+    // Track conversation history per session
+    let conversationHistory: ConversationMessage[] = [];
+    const MAX_ROUNDS = 5; // After 5 candidate responses, officer gives final verdict
 
     // Instantiate network throttler for simulated 3G network conditions
     const throttler = new NetworkThrottler({
@@ -97,18 +102,55 @@ fastify.register(async function (app: FastifyInstance) {
 
         if (message.type === 'submit_transcript') {
           const startTime = Date.now();
-          console.log(`\n📥 [Server] Received candidate response: "${message.transcript}"`);
+          const round = Math.floor(conversationHistory.length / 2) + 1;
+          console.log(`\n📥 [Server] Received candidate response (Round ${round}/${MAX_ROUNDS}): "${message.transcript}"`);
 
-          // 1. Run LLM Evaluation
-          const evalResult = await evaluatorRouter.evaluateCandidate(message.transcript);
+          // 1. Run LLM Evaluation with full conversation context
+          // On the MAX_ROUNDS round, the officer delivers the final verdict
+          const evalResult = await evaluatorRouter.evaluateCandidate(
+            message.transcript,
+            conversationHistory,
+            round
+          );
+
+          // Force final verdict on the last round if model didn't set it
+          if (round >= MAX_ROUNDS && !evalResult.is_final) {
+            evalResult.is_final = true;
+            evalResult.voice_mode = 'officer_british';
+            if (!evalResult.verdict) {
+              // Determine verdict from average score
+              const avgScore = evalResult.technical_score;
+              evalResult.verdict = avgScore >= 75 ? 'APPROVED' : avgScore >= 55 ? 'CONDITIONAL' : 'NOT_CONVINCING';
+            }
+            evalResult.feedback = `This concludes our interview. Based on all of your responses, my decision is: ${evalResult.verdict}. ${
+              evalResult.verdict === 'APPROVED'
+                ? 'Your technical knowledge and consistency are impressive. I am recommending approval of your H-1B petition. Have a good day.'
+                : evalResult.verdict === 'CONDITIONAL'
+                ? 'The consulate requires additional documentation to verify your claims. You will receive further instructions.'
+                : 'I am not convinced by the evidence presented in this interview. Your petition has been denied.'
+            }`;
+          }
+
           const evalLatencyMs = Date.now() - startTime;
+
+          // Update conversation history
+          conversationHistory.push({
+            role: 'candidate',
+            content: message.transcript
+          });
+          conversationHistory.push({
+            role: 'officer',
+            content: evalResult.feedback
+          });
 
           // Notify client of LLM verdict before TTS begins
           ws.send(
             JSON.stringify({
               type: 'eval_verdict',
               evalResult,
-              latencyMs: evalLatencyMs
+              latencyMs: evalLatencyMs,
+              conversationRound: round,
+              maxRounds: MAX_ROUNDS
             })
           );
 
