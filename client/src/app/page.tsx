@@ -3,12 +3,31 @@
 import React, { useState, useEffect, useRef } from "react";
 import { VoiceOrb, OrbState } from "@/components/VoiceOrb";
 import { PCMStreamPlayer } from "@/lib/pcm-player";
-import { Mic, MicOff, Send, Wifi, Activity, ShieldAlert, Cpu, Volume2 } from "lucide-react";
+import { AnalyticsModal } from "@/components/AnalyticsModal";
+import {
+  Mic,
+  MicOff,
+  Send,
+  Wifi,
+  Activity,
+  ShieldAlert,
+  Cpu,
+  Volume2,
+  BarChart3,
+} from "lucide-react";
 
 interface EvalVerdict {
   technical_score: number;
   voice_mode: "officer_british" | "indic_local";
   feedback: string;
+}
+
+interface TelemetryMetric {
+  ttfb: number;
+  evalLatency: number;
+  ttsLatency: number;
+  engineUsed: string;
+  packetLosses: number;
 }
 
 export default function VoiceDashboard() {
@@ -26,6 +45,8 @@ export default function VoiceDashboard() {
     packetLosses: 0,
   });
   const [isConnected, setIsConnected] = useState(false);
+  const [isAnalyticsOpen, setIsAnalyticsOpen] = useState(false);
+  const [metricsHistory, setMetricsHistory] = useState<TelemetryMetric[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pcmPlayerRef = useRef<PCMStreamPlayer | null>(null);
@@ -70,11 +91,15 @@ export default function VoiceDashboard() {
 
         setMetrics((prev) => {
           const isFirstFrame = prev.framesReceived === 0;
+          const calculatedTTFB = isFirstFrame
+            ? Date.now() - startTimeRef.current
+            : prev.ttfb;
+
           return {
             ...prev,
             framesReceived: prev.framesReceived + 1,
-            ttfb: isFirstFrame ? Date.now() - startTimeRef.current : prev.ttfb,
-            effectiveBandwidth: msg.metrics.effectiveBandwidthKbps,
+            ttfb: calculatedTTFB,
+            effectiveBandwidth: msg.metrics?.effectiveBandwidthKbps || 0,
           };
         });
       }
@@ -91,8 +116,12 @@ export default function VoiceDashboard() {
     wsRef.current = ws;
 
     // Web Speech API Initialization for Mic Recording
-    if (typeof window !== "undefined" && ("webkitSpeechRecognition" in window || "SpeechRecognition" in window)) {
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (
+      typeof window !== "undefined" &&
+      ("webkitSpeechRecognition" in window || "SpeechRecognition" in window)
+    ) {
+      const SpeechRecognition =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       const recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
@@ -115,6 +144,33 @@ export default function VoiceDashboard() {
       pcmPlayerRef.current?.stop();
     };
   }, []);
+
+  // Save current turn's metrics to telemetry history once evaluation stream finishes
+  useEffect(() => {
+    if (metrics.ttfb > 0 && metrics.evalLatency > 0 && metrics.ttsLatency > 0) {
+      setMetricsHistory((prev) => {
+        // Prevent duplicate appending for the same frame batch
+        const lastEntry = prev[prev.length - 1];
+        if (
+          lastEntry &&
+          lastEntry.ttfb === metrics.ttfb &&
+          lastEntry.evalLatency === metrics.evalLatency
+        ) {
+          return prev;
+        }
+        return [
+          ...prev,
+          {
+            ttfb: metrics.ttfb,
+            evalLatency: metrics.evalLatency,
+            ttsLatency: metrics.ttsLatency,
+            engineUsed: metrics.engineUsed,
+            packetLosses: metrics.packetLosses,
+          },
+        ];
+      });
+    }
+  }, [metrics]);
 
   const toggleRecording = () => {
     if (!recognitionRef.current) {
@@ -164,7 +220,7 @@ export default function VoiceDashboard() {
   };
 
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-between p-6 md:p-12 font-sans">
+    <main className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-between p-6 md:p-12 font-sans relative">
       {/* Header */}
       <header className="w-full max-w-5xl flex items-center justify-between border-b border-slate-800 pb-4">
         <div className="flex items-center space-x-3">
@@ -173,9 +229,20 @@ export default function VoiceDashboard() {
             VISA-BABU // Live Voice Workbench
           </h1>
         </div>
-        <div className="flex items-center space-x-2 text-xs font-mono bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-full">
-          <Wifi className={`w-3.5 h-3.5 ${isConnected ? "text-emerald-400" : "text-rose-500"}`} />
-          <span>{isConnected ? "WS CONNECTED (8080)" : "DISCONNECTED"}</span>
+
+        <div className="flex items-center space-x-3">
+          <button
+            onClick={() => setIsAnalyticsOpen(true)}
+            className="flex items-center space-x-2 text-xs font-mono bg-indigo-600/20 border border-indigo-500/40 hover:bg-indigo-600/30 text-indigo-300 px-3 py-1.5 rounded-full transition"
+          >
+            <BarChart3 className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Telemetry</span>
+          </button>
+
+          <div className="flex items-center space-x-2 text-xs font-mono bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-full">
+            <Wifi className={`w-3.5 h-3.5 ${isConnected ? "text-emerald-400" : "text-rose-500"}`} />
+            <span>{isConnected ? "WS CONNECTED (8080)" : "DISCONNECTED"}</span>
+          </div>
         </div>
       </header>
 
@@ -219,9 +286,13 @@ export default function VoiceDashboard() {
             <p className="text-lg font-medium text-slate-100 mb-3">"{verdict.feedback}"</p>
 
             <div className="flex items-center space-x-4 text-xs font-mono text-slate-400 border-t border-slate-800 pt-3">
-              <span>Voice Mode: <strong className="text-cyan-400">{verdict.voice_mode}</strong></span>
+              <span>
+                Voice Mode: <strong className="text-cyan-400">{verdict.voice_mode}</strong>
+              </span>
               <span>•</span>
-              <span>Routed Engine: <strong className="text-indigo-400">{metrics.engineUsed}</strong></span>
+              <span>
+                Routed Engine: <strong className="text-indigo-400">{metrics.engineUsed}</strong>
+              </span>
             </div>
           </div>
         )}
@@ -298,6 +369,13 @@ export default function VoiceDashboard() {
           <Send className="w-4 h-4" />
         </button>
       </div>
+
+      {/* Analytics Modal Component */}
+      <AnalyticsModal
+        isOpen={isAnalyticsOpen}
+        onClose={() => setIsAnalyticsOpen(false)}
+        metricsHistory={metricsHistory}
+      />
     </main>
   );
 }
