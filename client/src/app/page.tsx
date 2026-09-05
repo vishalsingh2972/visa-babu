@@ -1,19 +1,19 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { VoiceOrb, OrbState } from "@/components/VoiceOrb";
 import { PCMStreamPlayer } from "@/lib/pcm-player";
 import { AnalyticsModal } from "@/components/AnalyticsModal";
 import {
-  Mic,
-  MicOff,
-  Send,
+  Phone,
+  PhoneOff,
   Wifi,
   Activity,
   ShieldAlert,
   Cpu,
   Volume2,
   BarChart3,
+  Mic,
 } from "lucide-react";
 
 interface EvalVerdict {
@@ -33,7 +33,7 @@ interface TelemetryMetric {
 export default function VoiceDashboard() {
   const [orbState, setOrbState] = useState<OrbState>("idle");
   const [transcript, setTranscript] = useState("");
-  const [isRecording, setIsRecording] = useState(false);
+  const [isCallActive, setIsCallActive] = useState(false);
   const [verdict, setVerdict] = useState<EvalVerdict | null>(null);
   const [metrics, setMetrics] = useState({
     evalLatency: 0,
@@ -52,12 +52,90 @@ export default function VoiceDashboard() {
   const pcmPlayerRef = useRef<PCMStreamPlayer | null>(null);
   const recognitionRef = useRef<any>(null);
   const startTimeRef = useRef<number>(0);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const transcriptRef = useRef<string>("");
+
+  // Keep transcriptRef synchronized with state for callback access
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  // Function to transmit candidate speech over WebSocket
+  const sendTranscriptToServer = useCallback(() => {
+    const textToSend = transcriptRef.current.trim();
+    if (!wsRef.current || !textToSend || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    // Pause listening while server processes and streams audio response
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {
+        // Safe catch if already stopped
+      }
+    }
+
+    setOrbState("processing");
+    setVerdict(null);
+    setMetrics({
+      evalLatency: 0,
+      ttsLatency: 0,
+      ttfb: 0,
+      framesReceived: 0,
+      engineUsed: "-",
+      effectiveBandwidth: 0,
+      packetLosses: 0,
+    });
+
+    startTimeRef.current = Date.now();
+    wsRef.current.send(
+      JSON.stringify({
+        type: "submit_transcript",
+        transcript: textToSend,
+      })
+    );
+
+    // Clear local transcript buffer for next speech segment
+    setTranscript("");
+    transcriptRef.current = "";
+  }, []);
+
+  // Handle continuous audio chunk stream and trigger listening auto-resume
+  const handleIncomingAudioChunk = useCallback((base64Payload: string, metricsData: any) => {
+    if (pcmPlayerRef.current) {
+      pcmPlayerRef.current.playChunk(base64Payload);
+    }
+
+    setMetrics((prev) => {
+      const isFirstFrame = prev.framesReceived === 0;
+      const calculatedTTFB = isFirstFrame ? Date.now() - startTimeRef.current : prev.ttfb;
+
+      return {
+        ...prev,
+        framesReceived: prev.framesReceived + 1,
+        ttfb: calculatedTTFB,
+        effectiveBandwidth: metricsData?.effectiveBandwidthKbps || 0,
+      };
+    });
+
+    // Automatically transition to listening state once PCM audio finishes playing
+    if (pcmPlayerRef.current) {
+      pcmPlayerRef.current.onEnded = () => {
+        if (isCallActive && recognitionRef.current) {
+          try {
+            recognitionRef.current.start();
+            setOrbState("listening");
+          } catch (err) {
+            console.error("Failed auto-resuming mic:", err);
+          }
+        } else {
+          setOrbState("idle");
+        }
+      };
+    }
+  }, [isCallActive]);
 
   useEffect(() => {
-    // Instantiate PCM Stream Player (24kHz sample rate)
     pcmPlayerRef.current = new PCMStreamPlayer(24000);
-
-    // Instantiate WebSocket Connection
     const ws = new WebSocket("ws://localhost:8080/ws/eval");
 
     ws.onopen = () => {
@@ -84,24 +162,7 @@ export default function VoiceDashboard() {
       }
 
       if (msg.type === "audio_chunk") {
-        // Play incoming PCM chunk through Web Audio API
-        if (pcmPlayerRef.current) {
-          pcmPlayerRef.current.playChunk(msg.payloadBase64);
-        }
-
-        setMetrics((prev) => {
-          const isFirstFrame = prev.framesReceived === 0;
-          const calculatedTTFB = isFirstFrame
-            ? Date.now() - startTimeRef.current
-            : prev.ttfb;
-
-          return {
-            ...prev,
-            framesReceived: prev.framesReceived + 1,
-            ttfb: calculatedTTFB,
-            effectiveBandwidth: msg.metrics?.effectiveBandwidthKbps || 0,
-          };
-        });
+        handleIncomingAudioChunk(msg.payloadBase64, msg.metrics);
       }
 
       if (msg.type === "network_event" && msg.event === "packet_dropped") {
@@ -115,7 +176,7 @@ export default function VoiceDashboard() {
     ws.onclose = () => setIsConnected(false);
     wsRef.current = ws;
 
-    // Web Speech API Initialization for Mic Recording
+    // Web Speech API Continuous Speech Detection Initialization
     if (
       typeof window !== "undefined" &&
       ("webkitSpeechRecognition" in window || "SpeechRecognition" in window)
@@ -133,6 +194,16 @@ export default function VoiceDashboard() {
           currentTranscript += event.results[i][0].transcript;
         }
         setTranscript(currentTranscript);
+
+        // Reset silence detection timeout on speech activity
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+
+        // Auto-submit after 1.5 seconds of silence
+        silenceTimerRef.current = setTimeout(() => {
+          if (transcriptRef.current.trim().length > 0) {
+            sendTranscriptToServer();
+          }
+        }, 1500);
       };
 
       recognition.onerror = (err: any) => console.error("Mic error:", err);
@@ -142,14 +213,14 @@ export default function VoiceDashboard() {
     return () => {
       ws.close();
       pcmPlayerRef.current?.stop();
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
     };
-  }, []);
+  }, [handleIncomingAudioChunk, sendTranscriptToServer]);
 
-  // Save current turn's metrics to telemetry history once evaluation stream finishes
+  // Telemetry metric logging
   useEffect(() => {
     if (metrics.ttfb > 0 && metrics.evalLatency > 0 && metrics.ttsLatency > 0) {
       setMetricsHistory((prev) => {
-        // Prevent duplicate appending for the same frame batch
         const lastEntry = prev[prev.length - 1];
         if (
           lastEntry &&
@@ -172,51 +243,33 @@ export default function VoiceDashboard() {
     }
   }, [metrics]);
 
-  const toggleRecording = () => {
+  // One-click toggle for initiating or hanging up the hands-free call session
+  const toggleCallSession = () => {
     if (!recognitionRef.current) {
-      alert("Browser speech recognition is not supported in this browser. Try Chrome/Edge.");
+      alert("Speech Recognition API is not supported in this browser. Please use Chrome/Edge.");
       return;
     }
 
-    if (isRecording) {
-      recognitionRef.current.stop();
-      setIsRecording(false);
+    if (isCallActive) {
+      // Hang up session
+      try {
+        recognitionRef.current.stop();
+      } catch (e) {}
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      setIsCallActive(false);
       setOrbState("idle");
-    } else {
       setTranscript("");
-      recognitionRef.current.start();
-      setIsRecording(true);
-      setOrbState("listening");
+    } else {
+      // Start continuous call session
+      setTranscript("");
+      try {
+        recognitionRef.current.start();
+        setIsCallActive(true);
+        setOrbState("listening");
+      } catch (err) {
+        console.error("Error starting speech recognition:", err);
+      }
     }
-  };
-
-  const handleSubmit = () => {
-    if (!wsRef.current || !transcript.trim()) return;
-
-    if (isRecording && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsRecording(false);
-    }
-
-    setOrbState("processing");
-    setVerdict(null);
-    setMetrics({
-      evalLatency: 0,
-      ttsLatency: 0,
-      ttfb: 0,
-      framesReceived: 0,
-      engineUsed: "-",
-      effectiveBandwidth: 0,
-      packetLosses: 0,
-    });
-
-    startTimeRef.current = Date.now();
-    wsRef.current.send(
-      JSON.stringify({
-        type: "submit_transcript",
-        transcript,
-      })
-    );
   };
 
   return (
@@ -224,9 +277,13 @@ export default function VoiceDashboard() {
       {/* Header */}
       <header className="w-full max-w-5xl flex items-center justify-between border-b border-slate-800 pb-4">
         <div className="flex items-center space-x-3">
-          <div className="w-3 h-3 rounded-full bg-cyan-400 animate-pulse" />
+          <div
+            className={`w-3 h-3 rounded-full ${
+              isCallActive ? "bg-emerald-400 animate-ping" : "bg-cyan-400 animate-pulse"
+            }`}
+          />
           <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-cyan-400 to-indigo-400 bg-clip-text text-transparent">
-            VISA-BABU // Live Voice Workbench
+            VISA-BABU // Realtime Voice Session
           </h1>
         </div>
 
@@ -246,25 +303,65 @@ export default function VoiceDashboard() {
         </div>
       </header>
 
-      {/* Main Interactive Orb & Feedback Area */}
+      {/* Main Interactive Orb & Hands-free Session Controller */}
       <div className="w-full max-w-4xl flex flex-col items-center my-auto">
         <VoiceOrb
           state={orbState}
           audioLevel={orbState === "speaking" || orbState === "listening" ? 0.7 : 0.2}
-          onClick={toggleRecording}
+          onClick={toggleCallSession}
         />
 
-        {/* Live Speaking Indicator */}
+        {/* Call Action Button */}
+        <div className="mt-6 flex flex-col items-center space-y-3">
+          <button
+            onClick={toggleCallSession}
+            disabled={!isConnected}
+            className={`flex items-center space-x-3 px-8 py-4 rounded-full font-semibold text-sm transition-all shadow-xl ${
+              isCallActive
+                ? "bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/30 animate-pulse"
+                : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/30"
+            }`}
+          >
+            {isCallActive ? (
+              <>
+                <PhoneOff className="w-5 h-5" />
+                <span>End Call Session</span>
+              </>
+            ) : (
+              <>
+                <Phone className="w-5 h-5" />
+                <span>Start Hands-Free Call</span>
+              </>
+            )}
+          </button>
+          <span className="text-xs font-mono text-slate-500">
+            {isCallActive
+              ? "Speech detection active. Stop speaking for 1.5s to trigger evaluator."
+              : "Click once to start seamless continuous conversation."}
+          </span>
+        </div>
+
+        {/* Live Audio Streaming Banner */}
         {orbState === "speaking" && (
-          <div className="flex items-center space-x-2 text-xs font-mono text-cyan-400 bg-cyan-950/40 border border-cyan-800/50 px-4 py-1.5 rounded-full mb-4 animate-bounce">
+          <div className="flex items-center space-x-2 text-xs font-mono text-cyan-400 bg-cyan-950/40 border border-cyan-800/50 px-4 py-1.5 rounded-full mt-4 animate-bounce">
             <Volume2 className="w-4 h-4 animate-pulse" />
-            <span>Streaming PCM Audio via AudioContext...</span>
+            <span>Streaming Audio Response...</span>
+          </div>
+        )}
+
+        {/* Live Transcript Display */}
+        {isCallActive && transcript && (
+          <div className="w-full max-w-xl mt-6 p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md flex items-center space-x-3">
+            <Mic className="w-4 h-4 text-cyan-400 animate-pulse flex-shrink-0" />
+            <p className="text-sm font-mono text-slate-300 italic truncate">
+              "{transcript}"
+            </p>
           </div>
         )}
 
         {/* Verdict Card */}
         {verdict && (
-          <div className="w-full mt-4 p-6 rounded-2xl bg-slate-900/80 border border-slate-800 backdrop-blur-xl shadow-2xl transition-all duration-300">
+          <div className="w-full mt-6 p-6 rounded-2xl bg-slate-900/80 border border-slate-800 backdrop-blur-xl shadow-2xl transition-all duration-300">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center space-x-2">
                 <Cpu className="w-5 h-5 text-indigo-400" />
@@ -338,39 +435,7 @@ export default function VoiceDashboard() {
         </div>
       </div>
 
-      {/* Input Bar with Mic Recording Toggle */}
-      <div className="w-full max-w-3xl flex items-center space-x-3 bg-slate-900 border border-slate-800 p-2 rounded-2xl shadow-2xl mt-6">
-        <button
-          onClick={toggleRecording}
-          className={`p-3 rounded-xl transition-all ${
-            isRecording
-              ? "bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse"
-              : "text-slate-400 hover:text-cyan-400"
-          }`}
-          title={isRecording ? "Stop Recording" : "Start Mic Recording"}
-        >
-          {isRecording ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-        </button>
-
-        <input
-          type="text"
-          value={transcript}
-          onChange={(e) => setTranscript(e.target.value)}
-          placeholder={isRecording ? "Listening to your speech..." : "Speak or type your candidate response..."}
-          className="flex-1 bg-transparent text-slate-100 placeholder-slate-500 focus:outline-none text-sm px-2"
-        />
-
-        <button
-          onClick={handleSubmit}
-          disabled={!isConnected || orbState === "processing" || !transcript.trim()}
-          className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium text-sm transition-all flex items-center space-x-2 shadow-lg shadow-indigo-600/30"
-        >
-          <span>Evaluate</span>
-          <Send className="w-4 h-4" />
-        </button>
-      </div>
-
-      {/* Analytics Modal Component */}
+      {/* Telemetry Analytics Modal */}
       <AnalyticsModal
         isOpen={isAnalyticsOpen}
         onClose={() => setIsAnalyticsOpen(false)}
